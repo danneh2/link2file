@@ -138,8 +138,6 @@ async function convertFFmpeg(ffmpeg: string, inp: string, out: string, inExt: st
   }
 }
 
-const PH_COOKIES = "# Netscape HTTP Cookie File\n.pornhub.com\tTRUE\t/\tFALSE\t0\taccessAgeDisclaimerPH\t1\n.pornhub.com\tTRUE\t/\tFALSE\t0\tage_verified\t1\n.pornhub.com\tTRUE\t/\tFALSE\t0\tcountry\tUS";
-
 async function tryYtDlpRaw(url: string, cookies?: string): Promise<{ buffer: Buffer; title: string }> {
   let bin: string;
   try {
@@ -205,7 +203,66 @@ async function tryYtDlpRaw(url: string, cookies?: string): Promise<{ buffer: Buf
 async function tryYtDlp(url: string, cookies?: string): Promise<{ buffer: Buffer; title: string }> {
   const isPornhub = /pornhub\.com/i.test(url);
   if (isPornhub) {
-    return tryYtDlpRaw(url, PH_COOKIES);
+    // eslint-disable-next-line @typescript-eslint/no-require-imports
+    const { chromium } = require("playwright") as typeof import("playwright");
+    const browser = await chromium.launch({ headless: true, args: ["--no-sandbox", "--disable-setuid-sandbox"] });
+    try {
+      const context = await browser.newContext({
+        userAgent: "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36",
+        viewport: { width: 1920, height: 1080 },
+        locale: "en-US",
+      });
+      const page = await context.newPage();
+
+      let videoUrl = "";
+      page.on("response", (resp) => {
+        const u = resp.url();
+        if (!videoUrl && /\.(mp4|webm|m3u8)(\?|$)/.test(u) && !u.includes("thumb") && !u.includes("preview") && !u.includes("cdn-cgi")) {
+          videoUrl = u;
+        }
+      });
+
+      let embedUrl = url;
+      const viewkeyMatch = url.match(/viewkey=([a-zA-Z0-9]+)/i);
+      if (viewkeyMatch) {
+        embedUrl = `https://www.pornhub.com/embed/${viewkeyMatch[1]}`;
+      }
+
+      await page.goto(embedUrl, { waitUntil: "domcontentloaded", timeout: 30000 });
+      await page.waitForTimeout(8000);
+
+      if (!videoUrl) {
+        videoUrl = await page.evaluate(() => {
+          const v = document.querySelector("video source, video");
+          return (v as HTMLVideoElement)?.currentSrc || (v as HTMLSourceElement)?.src || "";
+        });
+      }
+
+      if (!videoUrl) throw new Error("Could not find video URL on PornHub page");
+
+      let title = extractName(url);
+      try {
+        title = await page.evaluate(() => {
+          const t = document.querySelector("title")?.textContent || "";
+          return t.replace(/\s*[-|]\s*PornHub.*$/i, "").trim() || "pornhub-video";
+        });
+      } catch { /* use fallback */ }
+
+      const vidRes = await fetch(videoUrl, {
+        signal: AbortSignal.timeout(120000),
+        headers: {
+          "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36",
+          "Referer": "https://www.pornhub.com/embed/",
+        },
+        redirect: "follow",
+      });
+      if (!vidRes.ok) throw new Error(`Video download failed: ${vidRes.status}`);
+      const buffer = Buffer.from(await vidRes.arrayBuffer());
+      if (buffer.length < 5000) throw new Error("Downloaded video too small");
+      return { buffer, title };
+    } finally {
+      await browser.close();
+    }
   }
   return tryYtDlpRaw(url, cookies);
 }
