@@ -215,23 +215,7 @@ async function tryYtDlp(url: string, cookies?: string): Promise<{ buffer: Buffer
       const page = await context.newPage();
 
       let videoUrl = "";
-      const seenUrls = new Set<string>();
-      page.on("response", async (resp) => {
-        const u = resp.url();
-        if (videoUrl || seenUrls.has(u)) return;
-        seenUrls.add(u);
-        const isMedia = /\.(mp4|webm|m3u8)(\?|$)/.test(u);
-        if (!isMedia) return;
-        if (/thumb|preview|sample|cdn-cgi|static|image|\.jpg|\.gif|\.png/i.test(u)) return;
-        // Check if it's actually a large file
-        try {
-          const ct = resp.headers()["content-type"] || "";
-          const cl = parseInt(resp.headers()["content-length"] || "0", 10);
-          if (ct.includes("text/html")) return;
-          if (cl > 0 && cl < 50000) return; // skip files under 50KB
-          videoUrl = u;
-        } catch { videoUrl = u; }
-      });
+      let title = extractName(url);
 
       let embedUrl = url;
       const viewkeyMatch = url.match(/viewkey=([a-zA-Z0-9]+)/i);
@@ -239,37 +223,91 @@ async function tryYtDlp(url: string, cookies?: string): Promise<{ buffer: Buffer
         embedUrl = `https://www.pornhub.com/embed/${viewkeyMatch[1]}`;
       }
 
-      await page.goto(embedUrl, { waitUntil: "networkidle", timeout: 30000 });
+      // Intercept large media responses
+      page.on("response", async (resp) => {
+        if (videoUrl) return;
+        try {
+          const u = resp.url();
+          const ct = resp.headers()["content-type"] || "";
+          const cl = parseInt(resp.headers()["content-length"] || "0", 10);
+          if (!/\.(mp4|webm|m3u8)/i.test(u)) return;
+          if (ct.includes("text/html")) return;
+          if (cl > 0 && cl < 500000) return; // skip anything under 500KB
+          videoUrl = u;
+        } catch { /* ignore */ }
+      });
 
-      // Wait for video to appear, polling every 2s up to 20s
-      for (let i = 0; i < 10 && !videoUrl; i++) {
-        await page.waitForTimeout(2000);
+      await page.goto(embedUrl, { waitUntil: "domcontentloaded", timeout: 30000 });
+
+      // Strategy 1: extract flashvars from raw page source (before JS runs)
+      const rawHtml = await page.content();
+      const flashvarsMatch = rawHtml.match(/var\s+flashvars\s*=\s*(\{[\s\S]*?\})\s*;/);
+      if (flashvarsMatch) {
+        try {
+          const fv = JSON.parse(flashvarsMatch[1]);
+          if (fv.video_url) videoUrl = fv.video_url;
+          if (!videoUrl && fv.defaultQuality) videoUrl = fv.defaultQuality;
+          if (!videoUrl && fv.mp4) {
+            const mp4 = typeof fv.mp4 === "string" ? fv.mp4 : fv.mp4?.videoUrl || "";
+            if (mp4) videoUrl = mp4;
+          }
+        } catch { /* ignore */ }
+      }
+
+      // Strategy 2: regex patterns on page source
+      if (!videoUrl) {
+        for (const pat of [
+          /"video_url"\s*:\s*"([^"]+)"/,
+          /"videoUrl"\s*:\s*"([^"]+)"/,
+          /video_url\s*=\s*["']([^"']+)/,
+          /"defaultQuality"\s*:\s*"(https?:[^"]+)"/,
+        ]) {
+          const m = rawHtml.match(pat);
+          if (m) { videoUrl = m[1].replace(/\\u002F/g, "/").replace(/\\\//g, "/"); break; }
+        }
+      }
+
+      // Strategy 3: wait for player to initialize and read from DOM + JS state
+      if (!videoUrl) {
+        await page.waitForTimeout(10000);
+
+        videoUrl = await page.evaluate(() => {
+          // Check video element
+          const v = document.querySelector("video");
+          if (v?.currentSrc && v.currentSrc.startsWith("http")) return v.currentSrc;
+
+          // Check for flashvars in global scope
+          try {
+            const w = window as unknown as Record<string, unknown>;
+            if (w.flashvars) {
+              const fv = w.flashvars as Record<string, string>;
+              if (fv.video_url) return fv.video_url;
+              if (fv.defaultQuality) return fv.defaultQuality;
+            }
+          } catch { /* ignore */ }
+
+          return "";
+        });
+      }
+
+      // Strategy 4: click play button if present, then wait for network
+      if (!videoUrl) {
+        try {
+          await page.click('button.play-btn, .plyr__play, [aria-label="Play"], .player-container button', { timeout: 3000 });
+        } catch { /* no play button */ }
+        await page.waitForTimeout(10000);
 
         if (!videoUrl) {
           videoUrl = await page.evaluate(() => {
-            const v = document.querySelector("video source, video");
-            return (v as HTMLVideoElement)?.currentSrc || (v as HTMLSourceElement)?.src || "";
+            const v = document.querySelector("video");
+            return v?.currentSrc || v?.querySelector("source")?.src || "";
           });
-        }
-
-        if (!videoUrl) {
-          const content = await page.content();
-          const patterns = [
-            /"video_url"\s*:\s*"([^"]+)"/,
-            /"videoUrl"\s*:\s*"([^"]+)"/,
-            /video_url\s*=\s*["']([^"']+)/,
-            /"defaultQuality"\s*:\s*"(https?:[^"]+)"/,
-          ];
-          for (const pat of patterns) {
-            const m = content.match(pat);
-            if (m) { videoUrl = m[1].replace(/\\u002F/g, "/").replace(/\\\//g, "/"); break; }
-          }
         }
       }
 
       if (!videoUrl) throw new Error("Could not find video URL on PornHub page");
 
-      let title = extractName(url);
+      // Get title
       try {
         title = await page.evaluate(() => {
           const t = document.querySelector("title")?.textContent || "";
@@ -287,7 +325,7 @@ async function tryYtDlp(url: string, cookies?: string): Promise<{ buffer: Buffer
       });
       if (!vidRes.ok) throw new Error(`Video download failed: ${vidRes.status}`);
       const buffer = Buffer.from(await vidRes.arrayBuffer());
-      if (buffer.length < 5000) throw new Error("Downloaded video too small");
+      if (buffer.length < 50000) throw new Error("Downloaded video too small");
       return { buffer, title };
     } finally {
       await browser.close();
