@@ -138,6 +138,8 @@ async function convertFFmpeg(ffmpeg: string, inp: string, out: string, inExt: st
   }
 }
 
+const PH_COOKIES = "accessAgeDisclaimerPH=1; age_verified=1; country=US; Secure; path=/; domain=.pornhub.com";
+
 async function tryPornhubDirect(url: string): Promise<{ buffer: Buffer; title: string }> {
   const viewkeyMatch = url.match(/viewkey=([a-zA-Z0-9]+)/i);
   if (!viewkeyMatch) throw new Error("Could not extract video ID from URL");
@@ -150,7 +152,7 @@ async function tryPornhubDirect(url: string): Promise<{ buffer: Buffer; title: s
       "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36",
       "Accept": "text/html",
       "Accept-Language": "en-US,en;q=0.9",
-      "Referer": "https://www.pornhub.com/",
+      "Cookie": PH_COOKIES,
     },
     redirect: "follow",
   });
@@ -159,26 +161,30 @@ async function tryPornhubDirect(url: string): Promise<{ buffer: Buffer; title: s
   const html = await embedRes.text();
 
   let videoUrl = "";
-  const urlPatterns = [
-    /"video_url"\s*:\s*"([^"]+)"/,
-    /"videoUrl"\s*:\s*"([^"]+)"/,
-    /"mp4"\s*:\s*\{\s*"videoUrl"\s*:\s*"([^"]+)"/,
-    /"defaultQuality"\s*:\s*"([^"]+)"/,
-    /video_url=(["'])([^'"&]+)\1/,
-    /src="(https?:\/\/[^"]*\.mp4[^"]*)"/,
-  ];
-  for (const pat of urlPatterns) {
-    const m = html.match(pat);
-    if (m) { videoUrl = (m[2] || m[1]).replace(/\\u002F/g, "/").replace(/\\\//g, "/"); break; }
+
+  // Look for flashvars with video_url inside
+  const flashvarsMatch = html.match(/var\s+flashvars\s*=\s*(\{[\s\S]*?\})\s*;/);
+  if (flashvarsMatch) {
+    try {
+      const fv = JSON.parse(flashvarsMatch[1]);
+      if (fv.video_url) videoUrl = fv.video_url;
+      if (!videoUrl && fv.defaultQuality) videoUrl = fv.defaultQuality;
+      if (!videoUrl && fv.mp4) {
+        const mp4 = typeof fv.mp4 === "string" ? fv.mp4 : fv.mp4.videoUrl || "";
+        if (mp4) videoUrl = mp4;
+      }
+    } catch { /* ignore */ }
   }
 
   if (!videoUrl) {
-    const flashvarsMatch = html.match(/var\s+flashvars\s*=\s*(\{[^}]+\})/);
-    if (flashvarsMatch) {
-      try {
-        const fv = JSON.parse(flashvarsMatch[1]);
-        videoUrl = fv.video_url || fv.defaultQuality || "";
-      } catch { /* ignore */ }
+    const patterns = [
+      /"video_url"\s*:\s*"([^"]+)"/,
+      /"videoUrl"\s*:\s*"([^"]+)"/,
+      /video_url\s*=\s*["']([^"']+)/,
+    ];
+    for (const pat of patterns) {
+      const m = html.match(pat);
+      if (m) { videoUrl = m[1].replace(/\\u002F/g, "/").replace(/\\\//g, "/"); break; }
     }
   }
 
@@ -192,12 +198,18 @@ async function tryPornhubDirect(url: string): Promise<{ buffer: Buffer; title: s
     headers: {
       "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36",
       "Referer": "https://www.pornhub.com/embed/",
+      "Cookie": PH_COOKIES,
     },
     redirect: "follow",
   });
   if (!vidRes.ok) throw new Error(`Video download failed: ${vidRes.status}`);
+
+  const ct = vidRes.headers.get("content-type") || "";
   const buffer = Buffer.from(await vidRes.arrayBuffer());
-  if (buffer.length < 1000) throw new Error("Downloaded video too small");
+  if (buffer.length < 5000 || ct.includes("text/html")) {
+    // URL returned a page instead of video — fall back to yt-dlp
+    throw new Error("Video URL returned non-video content");
+  }
   return { buffer, title };
 }
 
@@ -266,7 +278,12 @@ async function tryYtDlpRaw(url: string, cookies?: string): Promise<{ buffer: Buf
 async function tryYtDlp(url: string, cookies?: string): Promise<{ buffer: Buffer; title: string }> {
   const isPornhub = /pornhub\.com/i.test(url);
   if (isPornhub) {
-    return tryPornhubDirect(url);
+    try {
+      return await tryPornhubDirect(url);
+    } catch {
+      // fall through to yt-dlp with cookies
+    }
+    return tryYtDlpRaw(url, PH_COOKIES);
   }
   return tryYtDlpRaw(url, cookies);
 }
