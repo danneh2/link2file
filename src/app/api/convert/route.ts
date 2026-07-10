@@ -228,14 +228,32 @@ async function tryYtDlp(url: string, cookies?: string): Promise<{ buffer: Buffer
         embedUrl = `https://www.pornhub.com/embed/${viewkeyMatch[1]}`;
       }
 
-      await page.goto(embedUrl, { waitUntil: "domcontentloaded", timeout: 30000 });
-      await page.waitForTimeout(8000);
+      await page.goto(embedUrl, { waitUntil: "networkidle", timeout: 30000 });
 
-      if (!videoUrl) {
-        videoUrl = await page.evaluate(() => {
-          const v = document.querySelector("video source, video");
-          return (v as HTMLVideoElement)?.currentSrc || (v as HTMLSourceElement)?.src || "";
-        });
+      // Wait for video to appear, polling every 2s up to 20s
+      for (let i = 0; i < 10 && !videoUrl; i++) {
+        await page.waitForTimeout(2000);
+
+        if (!videoUrl) {
+          videoUrl = await page.evaluate(() => {
+            const v = document.querySelector("video source, video");
+            return (v as HTMLVideoElement)?.currentSrc || (v as HTMLSourceElement)?.src || "";
+          });
+        }
+
+        if (!videoUrl) {
+          const content = await page.content();
+          const patterns = [
+            /"video_url"\s*:\s*"([^"]+)"/,
+            /"videoUrl"\s*:\s*"([^"]+)"/,
+            /video_url\s*=\s*["']([^"']+)/,
+            /"defaultQuality"\s*:\s*"(https?:[^"]+)"/,
+          ];
+          for (const pat of patterns) {
+            const m = content.match(pat);
+            if (m) { videoUrl = m[1].replace(/\\u002F/g, "/").replace(/\\\//g, "/"); break; }
+          }
+        }
       }
 
       if (!videoUrl) throw new Error("Could not find video URL on PornHub page");
