@@ -215,11 +215,22 @@ async function tryYtDlp(url: string, cookies?: string): Promise<{ buffer: Buffer
       const page = await context.newPage();
 
       let videoUrl = "";
-      page.on("response", (resp) => {
+      const seenUrls = new Set<string>();
+      page.on("response", async (resp) => {
         const u = resp.url();
-        if (!videoUrl && /\.(mp4|webm|m3u8)(\?|$)/.test(u) && !u.includes("thumb") && !u.includes("preview") && !u.includes("cdn-cgi")) {
+        if (videoUrl || seenUrls.has(u)) return;
+        seenUrls.add(u);
+        const isMedia = /\.(mp4|webm|m3u8)(\?|$)/.test(u);
+        if (!isMedia) return;
+        if (/thumb|preview|sample|cdn-cgi|static|image|\.jpg|\.gif|\.png/i.test(u)) return;
+        // Check if it's actually a large file
+        try {
+          const ct = resp.headers()["content-type"] || "";
+          const cl = parseInt(resp.headers()["content-length"] || "0", 10);
+          if (ct.includes("text/html")) return;
+          if (cl > 0 && cl < 50000) return; // skip files under 50KB
           videoUrl = u;
-        }
+        } catch { videoUrl = u; }
       });
 
       let embedUrl = url;
