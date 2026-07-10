@@ -214,7 +214,6 @@ async function tryYtDlp(url: string, cookies?: string): Promise<{ buffer: Buffer
       });
       const page = await context.newPage();
 
-      let videoBuffer: Buffer | null = null;
       let title = extractName(url);
 
       let embedUrl = url;
@@ -223,93 +222,93 @@ async function tryYtDlp(url: string, cookies?: string): Promise<{ buffer: Buffer
         embedUrl = `https://www.pornhub.com/embed/${viewkeyMatch[1]}`;
       }
 
-      // Capture the actual video response body through the browser
-      page.on("response", async (resp) => {
-        if (videoBuffer) return;
-        try {
-          const u = resp.url();
-          const ct = resp.headers()["content-type"] || "";
-          const cl = parseInt(resp.headers()["content-length"] || "0", 10);
-          if (!/\.(mp4|webm)(\?|$)/i.test(u)) return;
-          if (ct.includes("text/html")) return;
-          if (/thumb|preview|sample|static/i.test(u)) return;
-          if (cl > 0 && cl < 1000000) return; // skip under 1MB
-          const body = await resp.body();
-          if (body.length > 1000000) {
-            videoBuffer = Buffer.from(body);
-          }
-        } catch { /* ignore */ }
-      });
+      await page.goto(embedUrl, { waitUntil: "networkidle", timeout: 30000 });
+      await page.waitForTimeout(3000);
 
-      await page.goto(embedUrl, { waitUntil: "domcontentloaded", timeout: 30000 });
-
-      // Try flashvars first
-      const rawHtml = await page.content();
-      let videoUrl = "";
-
-      const flashvarsMatch = rawHtml.match(/var\s+flashvars\s*=\s*(\{[\s\S]*?\})\s*;/);
-      if (flashvarsMatch) {
-        try {
-          const fv = JSON.parse(flashvarsMatch[1]);
-          if (fv.video_url) videoUrl = fv.video_url;
-          if (!videoUrl && fv.defaultQuality) videoUrl = fv.defaultQuality;
-        } catch { /* ignore */ }
-      }
-
-      if (!videoUrl) {
+      const videoUrl = await page.evaluate(() => {
+        const flashvarsMatch = document.documentElement.innerHTML.match(/var\s+flashvars\s*=\s*(\{[\s\S]*?\})\s*;/);
+        if (flashvarsMatch) {
+          try {
+            const fv = JSON.parse(flashvarsMatch[1]);
+            if (fv.video_url) return fv.video_url;
+            if (fv.defaultQuality) return fv.defaultQuality;
+            if (fv.mp4) {
+              const mp4 = typeof fv.mp4 === "string" ? fv.mp4 : fv.mp4?.videoUrl || "";
+              if (mp4) return mp4;
+            }
+            if (fv.video_url_text) return fv.video_url_text;
+          } catch { /* ignore */ }
+        }
         for (const pat of [
           /"video_url"\s*:\s*"([^"]+)"/,
           /"videoUrl"\s*:\s*"([^"]+)"/,
           /video_url\s*=\s*["']([^"']+)/,
         ]) {
-          const m = rawHtml.match(pat);
-          if (m) { videoUrl = m[1].replace(/\\u002F/g, "/").replace(/\\\//g, "/"); break; }
+          const m = document.documentElement.innerHTML.match(pat);
+          if (m) return m[1].replace(/\\u002F/g, "/").replace(/\\\//g, "/");
         }
-      }
+        const v = document.querySelector("video");
+        return v?.currentSrc || v?.querySelector("source")?.src || "";
+      });
 
-      // If we found a URL, navigate to it in the browser context to capture the response
-      if (videoUrl) {
-        const resp = await page.goto(videoUrl, { timeout: 60000, waitUntil: "commit" });
-        if (resp) {
-          const body = await resp.body();
-          if (body.length > 100000) {
-            videoBuffer = Buffer.from(body);
-          }
-        }
-      }
+      if (!videoUrl) throw new Error("Could not find video URL on PornHub page");
 
-      // If still no video, wait for the player to load and try clicking play
-      if (!videoBuffer) {
-        await page.waitForTimeout(5000);
-        try {
-          await page.click('button.play-btn, .plyr__play, [aria-label="Play"], #player_url', { timeout: 3000 });
-        } catch { /* no play button */ }
-        // Wait for video to buffer through the browser
-        await page.waitForTimeout(15000);
-      }
+      let finalUrl = videoUrl;
 
-      // Last resort: try to get video from the <video> element via CDP
-      if (!videoBuffer) {
-        const videoSrc = await page.evaluate(() => {
-          const v = document.querySelector("video");
-          return v?.currentSrc || v?.querySelector("source")?.src || "";
-        });
-        if (videoSrc && videoSrc.startsWith("http")) {
-          const resp = await page.goto(videoSrc, { timeout: 60000, waitUntil: "commit" });
-          if (resp) {
-            const body = await resp.body();
-            if (body.length > 100000) {
-              videoBuffer = Buffer.from(body);
+      if (videoUrl.includes(".m3u8")) {
+        const manifestResp = await page.goto(videoUrl, { timeout: 15000, waitUntil: "commit" });
+        if (manifestResp) {
+          const manifest = await manifestResp.text();
+          const lines = manifest.split("\n").map(l => l.trim()).filter(Boolean);
+          let bestHeight = 0;
+          let bestUrl = "";
+          for (let i = 0; i < lines.length; i++) {
+            if (lines[i].startsWith("#EXT-X-STREAM-INF")) {
+              const hMatch = lines[i].match(/RESOLUTION=\d+x(\d+)/);
+              const h = hMatch ? parseInt(hMatch[1], 10) : 0;
+              if (h > bestHeight && i + 1 < lines.length && !lines[i + 1].startsWith("#")) {
+                bestHeight = h;
+                const nextLine = lines[i + 1];
+                if (nextLine.startsWith("http")) {
+                  bestUrl = nextLine;
+                } else {
+                  try {
+                    const base = new URL(videoUrl);
+                    bestUrl = new URL(nextLine, base).href;
+                  } catch { bestUrl = nextLine; }
+                }
+              }
             }
           }
+          if (bestUrl) finalUrl = bestUrl;
         }
+        // Navigate back to embed to get title
+        await page.goto(embedUrl, { waitUntil: "domcontentloaded", timeout: 15000 }).catch(() => {});
       }
 
-      if (!videoBuffer || videoBuffer.length < 100000) {
-        throw new Error("Could not download video from PornHub");
-      }
+      let inExt = "mp4";
+      if (finalUrl.includes(".m3u8")) inExt = "m3u8";
+      else if (finalUrl.includes(".webm")) inExt = "webm";
 
-      // Get title
+      const ffmpeg = getFfmpegPath();
+      const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), "ph-"));
+      const outPath = path.join(tmpDir, `video.${inExt === "m3u8" ? "mp4" : inExt}`);
+
+      const a = ["-y", "-referer", "https://www.pornhub.com/", "-user_agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"];
+      if (inExt === "m3u8") {
+        a.push("-headers", "Referer: https://www.pornhub.com/\r\nUser-Agent: Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36\r\n");
+      }
+      a.push("-i", finalUrl);
+      if (inExt === "m3u8") {
+        a.push("-c", "copy", "-bsf:a", "aac_adtstoasc");
+      }
+      a.push(outPath);
+
+      await execAsync(`"${ffmpeg}" ${a.join(" ")}`, { timeout: 120000 });
+
+      const buffer = fs.readFileSync(outPath);
+      if (buffer.length < 100000) throw new Error("Downloaded video too small");
+
       try {
         title = await page.evaluate(() => {
           const t = document.querySelector("title")?.textContent || "";
@@ -317,7 +316,9 @@ async function tryYtDlp(url: string, cookies?: string): Promise<{ buffer: Buffer
         });
       } catch { /* use fallback */ }
 
-      return { buffer: videoBuffer, title };
+      try { fs.rmSync(tmpDir, { recursive: true, force: true }); } catch { /* */ }
+
+      return { buffer, title };
     } finally {
       await browser.close();
     }
