@@ -332,7 +332,6 @@ export default function Home() {
                   { name: "Dailymotion", status: "works" },
                   { name: "Facebook", status: "works" },
                   { name: "Reddit", status: "works" },
-                  { name: "PornHub", status: "works" },
                 ].map((site) => (
                   <div key={site.name} className="flex items-center justify-center gap-1.5 px-3 py-2 rounded-lg bg-green-50 border border-green-200">
                     <Check className="w-3.5 h-3.5 text-green-600" />
