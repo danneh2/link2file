@@ -138,46 +138,67 @@ async function convertFFmpeg(ffmpeg: string, inp: string, out: string, inExt: st
   }
 }
 
-const PH_COOKIE_CACHE = path.join(os.tmpdir(), "ph_cookies.txt");
+async function tryPornhubDirect(url: string): Promise<{ buffer: Buffer; title: string }> {
+  const viewkeyMatch = url.match(/viewkey=([a-zA-Z0-9]+)/i);
+  if (!viewkeyMatch) throw new Error("Could not extract video ID from URL");
+  const viewkey = viewkeyMatch[1];
+  const embedUrl = `https://www.pornhub.com/embed/${viewkey}`;
 
-async function ensurePornhubCookies(): Promise<string> {
-  if (fs.existsSync(PH_COOKIE_CACHE)) {
-    const age = Date.now() - fs.statSync(PH_COOKIE_CACHE).mtimeMs;
-    if (age < 24 * 60 * 60 * 1000) {
-      return fs.readFileSync(PH_COOKIE_CACHE, "utf-8");
+  const embedRes = await fetch(embedUrl, {
+    signal: AbortSignal.timeout(15000),
+    headers: {
+      "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36",
+      "Accept": "text/html",
+      "Accept-Language": "en-US,en;q=0.9",
+      "Referer": "https://www.pornhub.com/",
+    },
+    redirect: "follow",
+  });
+  if (!embedRes.ok) throw new Error(`Embed page fetch failed: ${embedRes.status}`);
+
+  const html = await embedRes.text();
+
+  let videoUrl = "";
+  const urlPatterns = [
+    /"video_url"\s*:\s*"([^"]+)"/,
+    /"videoUrl"\s*:\s*"([^"]+)"/,
+    /"mp4"\s*:\s*\{\s*"videoUrl"\s*:\s*"([^"]+)"/,
+    /"defaultQuality"\s*:\s*"([^"]+)"/,
+    /video_url=(["'])([^'"&]+)\1/,
+    /src="(https?:\/\/[^"]*\.mp4[^"]*)"/,
+  ];
+  for (const pat of urlPatterns) {
+    const m = html.match(pat);
+    if (m) { videoUrl = (m[2] || m[1]).replace(/\\u002F/g, "/").replace(/\\\//g, "/"); break; }
+  }
+
+  if (!videoUrl) {
+    const flashvarsMatch = html.match(/var\s+flashvars\s*=\s*(\{[^}]+\})/);
+    if (flashvarsMatch) {
+      try {
+        const fv = JSON.parse(flashvarsMatch[1]);
+        videoUrl = fv.video_url || fv.defaultQuality || "";
+      } catch { /* ignore */ }
     }
   }
 
-  // eslint-disable-next-line @typescript-eslint/no-require-imports
-  const { chromium } = require("playwright") as typeof import("playwright");
-  const browser = await chromium.launch({ headless: true, args: ["--no-sandbox", "--disable-setuid-sandbox"] });
-  try {
-    const context = await browser.newContext({
-      userAgent: "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36",
-      locale: "en-US",
-    });
-    const page = await context.newPage();
-    await page.goto("https://www.pornhub.com/", { waitUntil: "domcontentloaded", timeout: 20000 });
-    try {
-      await page.click('input[type="submit"], button:has-text("Enter"), .ageGateEnterButton, #ageGateForm button', { timeout: 5000 });
-      await page.waitForTimeout(2000);
-    } catch { /* already past age gate or no gate */ }
+  if (!videoUrl) throw new Error("Could not extract video URL from embed page");
 
-    const cookies = await context.cookies();
-    const netscape = [
-      "# Netscape HTTP Cookie File",
-      ...cookies.map(c => {
-        const domain = c.domain.startsWith(".") ? c.domain : "." + c.domain;
-        const expiry = c.expires > 0 ? Math.floor(c.expires) : 0;
-        return `${domain}\tTRUE\t${c.path}\t${c.secure ? "TRUE" : "FALSE"}\t${expiry}\t${c.name}\t${c.value}`;
-      }),
-    ].join("\n");
+  const title = html.match(/<title>([^<]+)<\/title>/i)?.[1]
+    ?.replace(/\s*[-|]\s*PornHub.*$/i, "").trim() || extractName(url);
 
-    fs.writeFileSync(PH_COOKIE_CACHE, netscape, "utf-8");
-    return netscape;
-  } finally {
-    await browser.close();
-  }
+  const vidRes = await fetch(videoUrl, {
+    signal: AbortSignal.timeout(60000),
+    headers: {
+      "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36",
+      "Referer": "https://www.pornhub.com/embed/",
+    },
+    redirect: "follow",
+  });
+  if (!vidRes.ok) throw new Error(`Video download failed: ${vidRes.status}`);
+  const buffer = Buffer.from(await vidRes.arrayBuffer());
+  if (buffer.length < 1000) throw new Error("Downloaded video too small");
+  return { buffer, title };
 }
 
 async function tryYtDlpRaw(url: string, cookies?: string): Promise<{ buffer: Buffer; title: string }> {
@@ -245,11 +266,7 @@ async function tryYtDlpRaw(url: string, cookies?: string): Promise<{ buffer: Buf
 async function tryYtDlp(url: string, cookies?: string): Promise<{ buffer: Buffer; title: string }> {
   const isPornhub = /pornhub\.com/i.test(url);
   if (isPornhub) {
-    let phCookies = cookies?.trim();
-    if (!phCookies) {
-      phCookies = await ensurePornhubCookies();
-    }
-    return tryYtDlpRaw(url, phCookies);
+    return tryPornhubDirect(url);
   }
   return tryYtDlpRaw(url, cookies);
 }
