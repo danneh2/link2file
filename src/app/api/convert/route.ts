@@ -138,7 +138,7 @@ async function convertFFmpeg(ffmpeg: string, inp: string, out: string, inExt: st
   }
 }
 
-const PH_COOKIES = "accessAgeDisclaimerPH=1; age_verified=1; country=US; Secure; path=/; domain=.pornhub.com";
+const PH_COOKIES = "# Netscape HTTP Cookie File\n.pornhub.com\tTRUE\t/\tFALSE\t0\taccessAgeDisclaimerPH\t1\n.pornhub.com\tTRUE\t/\tFALSE\t0\tage_verified\t1\n.pornhub.com\tTRUE\t/\tFALSE\t0\tcountry\tUS";
 
 async function tryPornhubDirect(url: string): Promise<{ buffer: Buffer; title: string }> {
   const viewkeyMatch = url.match(/viewkey=([a-zA-Z0-9]+)/i);
