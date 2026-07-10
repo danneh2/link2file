@@ -214,7 +214,7 @@ async function tryYtDlp(url: string, cookies?: string): Promise<{ buffer: Buffer
       });
       const page = await context.newPage();
 
-      let videoUrl = "";
+      let videoBuffer: Buffer | null = null;
       let title = extractName(url);
 
       let embedUrl = url;
@@ -223,89 +223,91 @@ async function tryYtDlp(url: string, cookies?: string): Promise<{ buffer: Buffer
         embedUrl = `https://www.pornhub.com/embed/${viewkeyMatch[1]}`;
       }
 
-      // Intercept large media responses
+      // Capture the actual video response body through the browser
       page.on("response", async (resp) => {
-        if (videoUrl) return;
+        if (videoBuffer) return;
         try {
           const u = resp.url();
           const ct = resp.headers()["content-type"] || "";
           const cl = parseInt(resp.headers()["content-length"] || "0", 10);
-          if (!/\.(mp4|webm|m3u8)/i.test(u)) return;
+          if (!/\.(mp4|webm)(\?|$)/i.test(u)) return;
           if (ct.includes("text/html")) return;
-          if (cl > 0 && cl < 500000) return; // skip anything under 500KB
-          videoUrl = u;
+          if (/thumb|preview|sample|static/i.test(u)) return;
+          if (cl > 0 && cl < 1000000) return; // skip under 1MB
+          const body = await resp.body();
+          if (body.length > 1000000) {
+            videoBuffer = Buffer.from(body);
+          }
         } catch { /* ignore */ }
       });
 
       await page.goto(embedUrl, { waitUntil: "domcontentloaded", timeout: 30000 });
 
-      // Strategy 1: extract flashvars from raw page source (before JS runs)
+      // Try flashvars first
       const rawHtml = await page.content();
+      let videoUrl = "";
+
       const flashvarsMatch = rawHtml.match(/var\s+flashvars\s*=\s*(\{[\s\S]*?\})\s*;/);
       if (flashvarsMatch) {
         try {
           const fv = JSON.parse(flashvarsMatch[1]);
           if (fv.video_url) videoUrl = fv.video_url;
           if (!videoUrl && fv.defaultQuality) videoUrl = fv.defaultQuality;
-          if (!videoUrl && fv.mp4) {
-            const mp4 = typeof fv.mp4 === "string" ? fv.mp4 : fv.mp4?.videoUrl || "";
-            if (mp4) videoUrl = mp4;
-          }
         } catch { /* ignore */ }
       }
 
-      // Strategy 2: regex patterns on page source
       if (!videoUrl) {
         for (const pat of [
           /"video_url"\s*:\s*"([^"]+)"/,
           /"videoUrl"\s*:\s*"([^"]+)"/,
           /video_url\s*=\s*["']([^"']+)/,
-          /"defaultQuality"\s*:\s*"(https?:[^"]+)"/,
         ]) {
           const m = rawHtml.match(pat);
           if (m) { videoUrl = m[1].replace(/\\u002F/g, "/").replace(/\\\//g, "/"); break; }
         }
       }
 
-      // Strategy 3: wait for player to initialize and read from DOM + JS state
-      if (!videoUrl) {
-        await page.waitForTimeout(10000);
-
-        videoUrl = await page.evaluate(() => {
-          // Check video element
-          const v = document.querySelector("video");
-          if (v?.currentSrc && v.currentSrc.startsWith("http")) return v.currentSrc;
-
-          // Check for flashvars in global scope
-          try {
-            const w = window as unknown as Record<string, unknown>;
-            if (w.flashvars) {
-              const fv = w.flashvars as Record<string, string>;
-              if (fv.video_url) return fv.video_url;
-              if (fv.defaultQuality) return fv.defaultQuality;
-            }
-          } catch { /* ignore */ }
-
-          return "";
-        });
-      }
-
-      // Strategy 4: click play button if present, then wait for network
-      if (!videoUrl) {
-        try {
-          await page.click('button.play-btn, .plyr__play, [aria-label="Play"], .player-container button', { timeout: 3000 });
-        } catch { /* no play button */ }
-        await page.waitForTimeout(10000);
-
-        if (!videoUrl) {
-          videoUrl = await page.evaluate(() => {
-            const v = document.querySelector("video");
-            return v?.currentSrc || v?.querySelector("source")?.src || "";
-          });
+      // If we found a URL, navigate to it in the browser context to capture the response
+      if (videoUrl) {
+        const resp = await page.goto(videoUrl, { timeout: 60000, waitUntil: "commit" });
+        if (resp) {
+          const body = await resp.body();
+          if (body.length > 100000) {
+            videoBuffer = Buffer.from(body);
+          }
         }
       }
 
-      if (!videoUrl) throw new Error("Could not find video URL on PornHub page");
+      // If still no video, wait for the player to load and try clicking play
+      if (!videoBuffer) {
+        await page.waitForTimeout(5000);
+        try {
+          await page.click('button.play-btn, .plyr__play, [aria-label="Play"], #player_url', { timeout: 3000 });
+        } catch { /* no play button */ }
+        // Wait for video to buffer through the browser
+        await page.waitForTimeout(15000);
+      }
+
+      // Last resort: try to get video from the <video> element via CDP
+      if (!videoBuffer) {
+        const videoSrc = await page.evaluate(() => {
+          const v = document.querySelector("video");
+          return v?.currentSrc || v?.querySelector("source")?.src || "";
+        });
+        if (videoSrc && videoSrc.startsWith("http")) {
+          const resp = await page.goto(videoSrc, { timeout: 60000, waitUntil: "commit" });
+          if (resp) {
+            const body = await resp.body();
+            if (body.length > 100000) {
+              videoBuffer = Buffer.from(body);
+            }
+          }
+        }
+      }
+
+      if (!videoBuffer || videoBuffer.length < 100000) {
+        throw new Error("Could not download video from PornHub");
+      }
 
       // Get title
       try {
@@ -315,18 +317,7 @@ async function tryYtDlp(url: string, cookies?: string): Promise<{ buffer: Buffer
         });
       } catch { /* use fallback */ }
 
-      const vidRes = await fetch(videoUrl, {
-        signal: AbortSignal.timeout(120000),
-        headers: {
-          "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36",
-          "Referer": "https://www.pornhub.com/embed/",
-        },
-        redirect: "follow",
-      });
-      if (!vidRes.ok) throw new Error(`Video download failed: ${vidRes.status}`);
-      const buffer = Buffer.from(await vidRes.arrayBuffer());
-      if (buffer.length < 50000) throw new Error("Downloaded video too small");
-      return { buffer, title };
+      return { buffer: videoBuffer, title };
     } finally {
       await browser.close();
     }
