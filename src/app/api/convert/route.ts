@@ -140,79 +140,6 @@ async function convertFFmpeg(ffmpeg: string, inp: string, out: string, inExt: st
 
 const PH_COOKIES = "# Netscape HTTP Cookie File\n.pornhub.com\tTRUE\t/\tFALSE\t0\taccessAgeDisclaimerPH\t1\n.pornhub.com\tTRUE\t/\tFALSE\t0\tage_verified\t1\n.pornhub.com\tTRUE\t/\tFALSE\t0\tcountry\tUS";
 
-async function tryPornhubDirect(url: string): Promise<{ buffer: Buffer; title: string }> {
-  const viewkeyMatch = url.match(/viewkey=([a-zA-Z0-9]+)/i);
-  if (!viewkeyMatch) throw new Error("Could not extract video ID from URL");
-  const viewkey = viewkeyMatch[1];
-  const embedUrl = `https://www.pornhub.com/embed/${viewkey}`;
-
-  const embedRes = await fetch(embedUrl, {
-    signal: AbortSignal.timeout(15000),
-    headers: {
-      "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36",
-      "Accept": "text/html",
-      "Accept-Language": "en-US,en;q=0.9",
-      "Cookie": PH_COOKIES,
-    },
-    redirect: "follow",
-  });
-  if (!embedRes.ok) throw new Error(`Embed page fetch failed: ${embedRes.status}`);
-
-  const html = await embedRes.text();
-
-  let videoUrl = "";
-
-  // Look for flashvars with video_url inside
-  const flashvarsMatch = html.match(/var\s+flashvars\s*=\s*(\{[\s\S]*?\})\s*;/);
-  if (flashvarsMatch) {
-    try {
-      const fv = JSON.parse(flashvarsMatch[1]);
-      if (fv.video_url) videoUrl = fv.video_url;
-      if (!videoUrl && fv.defaultQuality) videoUrl = fv.defaultQuality;
-      if (!videoUrl && fv.mp4) {
-        const mp4 = typeof fv.mp4 === "string" ? fv.mp4 : fv.mp4.videoUrl || "";
-        if (mp4) videoUrl = mp4;
-      }
-    } catch { /* ignore */ }
-  }
-
-  if (!videoUrl) {
-    const patterns = [
-      /"video_url"\s*:\s*"([^"]+)"/,
-      /"videoUrl"\s*:\s*"([^"]+)"/,
-      /video_url\s*=\s*["']([^"']+)/,
-    ];
-    for (const pat of patterns) {
-      const m = html.match(pat);
-      if (m) { videoUrl = m[1].replace(/\\u002F/g, "/").replace(/\\\//g, "/"); break; }
-    }
-  }
-
-  if (!videoUrl) throw new Error("Could not extract video URL from embed page");
-
-  const title = html.match(/<title>([^<]+)<\/title>/i)?.[1]
-    ?.replace(/\s*[-|]\s*PornHub.*$/i, "").trim() || extractName(url);
-
-  const vidRes = await fetch(videoUrl, {
-    signal: AbortSignal.timeout(60000),
-    headers: {
-      "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36",
-      "Referer": "https://www.pornhub.com/embed/",
-      "Cookie": PH_COOKIES,
-    },
-    redirect: "follow",
-  });
-  if (!vidRes.ok) throw new Error(`Video download failed: ${vidRes.status}`);
-
-  const ct = vidRes.headers.get("content-type") || "";
-  const buffer = Buffer.from(await vidRes.arrayBuffer());
-  if (buffer.length < 5000 || ct.includes("text/html")) {
-    // URL returned a page instead of video — fall back to yt-dlp
-    throw new Error("Video URL returned non-video content");
-  }
-  return { buffer, title };
-}
-
 async function tryYtDlpRaw(url: string, cookies?: string): Promise<{ buffer: Buffer; title: string }> {
   let bin: string;
   try {
@@ -278,11 +205,6 @@ async function tryYtDlpRaw(url: string, cookies?: string): Promise<{ buffer: Buf
 async function tryYtDlp(url: string, cookies?: string): Promise<{ buffer: Buffer; title: string }> {
   const isPornhub = /pornhub\.com/i.test(url);
   if (isPornhub) {
-    try {
-      return await tryPornhubDirect(url);
-    } catch {
-      // fall through to yt-dlp with cookies
-    }
     return tryYtDlpRaw(url, PH_COOKIES);
   }
   return tryYtDlpRaw(url, cookies);
